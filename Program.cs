@@ -6,6 +6,8 @@ using System.Threading;
 using System.Net.Http;
 using System.Net.Http.Json;
 using System.Threading.Tasks;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
 
 class Program
 {
@@ -31,69 +33,152 @@ class Program
     );
 
     static string currentApplication = "";
+    static string configuredDeviceId = "";
+static string configuredDeviceToken = "";
 
     static DateTime sessionStartedAt;
 
     static long activeSeconds = 0;
     static long idleSeconds = 0;
 
-    const uint IDLE_THRESHOLD_SECONDS = 10;
+    static uint idleThresholdSeconds = 10;
+static int pollIntervalMilliseconds = 2000;
+public static int GetPollIntervalMilliseconds()
+{
+    return pollIntervalMilliseconds;
+}
 
-    static readonly HttpClient httpClient = new HttpClient();
+static readonly HttpClient httpClient = new HttpClient();
+static readonly SemaphoreSlim uploadLock = new SemaphoreSlim(1, 1);
 
-    const string API_URL =
-    "http://192.168.0.246:5000/api/employee-activity";
-
-const string EMPLOYEE_ID = "EMP004";
+static string apiUrl = "";
 
 
-    static async Task Main()
+
+
+
+static bool LoadConfiguration()
+{
+    string configPath = Path.Combine(
+        AppContext.BaseDirectory,
+        "config.txt"
+    );
+
+    if (!File.Exists(configPath))
     {
-        SQLiteStorage.Initialize();
-
-        Console.Title = "ERP Windows Agent";
-
-        Console.WriteLine("ERP Windows Agent Started");
-        Console.WriteLine("==========================");
-
-        // Upload existing unsynced records once when agent starts
-        await UploadUnsyncedSessions();
-
-        Console.CancelKeyPress += (sender, e) =>
-        {
-            e.Cancel = true;
-
-            Console.WriteLine();
-            Console.WriteLine("Stopping ERP Windows Agent...");
-
-            if (!string.IsNullOrEmpty(currentApplication))
-            {
-                SaveSession();
-            }
-
-            SQLiteStorage.PrintSessions();
-
-            Environment.Exit(0);
-        };
-
-        while (true)
-        {
-            try
-            {
-                TrackActivity();
-
-                Thread.Sleep(2000);
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Error: {ex.Message}");
-
-                Thread.Sleep(2000);
-            }
-        }
+        Console.WriteLine("ERROR: config.txt not found.");
+        Console.WriteLine($"Expected location: {configPath}");
+        return false;
     }
 
+    string[] lines = File.ReadAllLines(configPath);
 
+    foreach (string line in lines)
+    {
+        string trimmedLine = line.Trim();
+
+        if (trimmedLine.StartsWith("DEVICE_ID="))
+        {
+            configuredDeviceId = trimmedLine
+                .Substring("DEVICE_ID=".Length)
+                .Trim();
+        }
+        else if (trimmedLine.StartsWith("DEVICE_TOKEN="))
+        {
+            configuredDeviceToken = trimmedLine
+                .Substring("DEVICE_TOKEN=".Length)
+                .Trim();
+        }
+        else if (trimmedLine.StartsWith("API_URL="))
+        {
+            apiUrl = trimmedLine
+                .Substring("API_URL=".Length)
+                .Trim();
+        }
+        else if (trimmedLine.StartsWith("IDLE_THRESHOLD_SECONDS="))
+{
+    string value = trimmedLine
+        .Substring("IDLE_THRESHOLD_SECONDS=".Length)
+        .Trim();
+
+    if (!uint.TryParse(value, out idleThresholdSeconds))
+    {
+        Console.WriteLine("ERROR: Invalid IDLE_THRESHOLD_SECONDS.");
+        return false;
+    }
+}
+else if (trimmedLine.StartsWith("POLL_INTERVAL_MILLISECONDS="))
+{
+    string value = trimmedLine
+        .Substring("POLL_INTERVAL_MILLISECONDS=".Length)
+        .Trim();
+
+    if (!int.TryParse(value, out pollIntervalMilliseconds))
+    {
+        Console.WriteLine("ERROR: Invalid POLL_INTERVAL_MILLISECONDS.");
+        return false;
+    }
+}
+    }
+
+    if (string.IsNullOrWhiteSpace(configuredDeviceId))
+    {
+        Console.WriteLine("ERROR: DEVICE_ID is missing in config.txt.");
+        return false;
+    }
+
+    if (string.IsNullOrWhiteSpace(configuredDeviceToken))
+    {
+        Console.WriteLine("ERROR: DEVICE_TOKEN is missing in config.txt.");
+        return false;
+    }
+
+    if (string.IsNullOrWhiteSpace(apiUrl))
+    {
+        Console.WriteLine("ERROR: API_URL is missing in config.txt.");
+        return false;
+    }
+
+    return true;
+}
+   static async Task Main()
+{
+    if (!LoadConfiguration())
+    {
+        Console.WriteLine();
+        Console.WriteLine("Agent cannot start without configuration.");
+        Console.ReadKey();
+        return;
+    }
+
+    SQLiteStorage.Initialize();
+
+    Console.Title = "ERP Windows Agent";
+
+    Console.WriteLine("ERP Windows Agent Started");
+    Console.WriteLine("==========================");
+
+    // Upload existing unsynced records once when agent starts
+    await UploadUnsyncedSessions();
+
+    var builder = Host.CreateApplicationBuilder();
+
+    builder.Services.AddWindowsService(options =>
+    {
+        options.ServiceName = "ERP Windows Agent";
+    });
+
+    builder.Services.AddHostedService<AgentWorker>();
+
+    var host = builder.Build();
+
+    await host.RunAsync();
+}
+
+public static void TrackActivityForWorker()
+{
+    TrackActivity();
+}
     static void TrackActivity()
 {
     IntPtr hwnd = GetForegroundWindow();
@@ -122,8 +207,8 @@ const string EMPLOYEE_ID = "EMP004";
 
     uint currentIdleSeconds = GetIdleSeconds();
 
-    bool isIdle =
-        currentIdleSeconds >= IDLE_THRESHOLD_SECONDS;
+   bool isIdle =
+    currentIdleSeconds >= idleThresholdSeconds;
 
 
     // ==========================================
@@ -255,7 +340,7 @@ static void DisplayStatus(
     Console.WriteLine();
 
     Console.WriteLine(
-        $"Idle threshold: {IDLE_THRESHOLD_SECONDS} seconds"
+        $"Idle threshold: {idleThresholdSeconds} seconds"
     );
 }
     static void SaveSession()
@@ -310,49 +395,43 @@ static void DisplayStatus(
     }
 
 
-    static async Task UploadUnsyncedSessions()
+  static async Task UploadUnsyncedSessions()
+{
+    // Prevent multiple upload operations from running at the same time
+    if (!await uploadLock.WaitAsync(0))
     {
-        var sessions =
-            SQLiteStorage.GetUnsyncedSessions();
+        Console.WriteLine("Upload already in progress. Skipping.");
+        return;
+    }
+
+    try
+    {
+        var sessions = SQLiteStorage.GetUnsyncedSessions();
 
         foreach (var session in sessions)
         {
             var data = new
             {
-                employeeId = EMPLOYEE_ID,
-
-                computerName =
-                    Environment.MachineName,
-
-                application =
-                    session.Application,
-
-                startedAt =
-                    session.StartedAt,
-
-                endedAt =
-                    session.EndedAt,
-
-                activeSeconds =
-                    session.ActiveSeconds,
-
-                idleSeconds =
-                    session.IdleSeconds
+                deviceId = configuredDeviceId,
+                deviceToken = configuredDeviceToken,
+                computerName = Environment.MachineName,
+                application = session.Application,
+                startedAt = session.StartedAt,
+                endedAt = session.EndedAt,
+                activeSeconds = session.ActiveSeconds,
+                idleSeconds = session.IdleSeconds
             };
 
             try
             {
-                var response =
-                    await httpClient.PostAsJsonAsync(
-                        API_URL,
-                        data
-                    );
+                var response = await httpClient.PostAsJsonAsync(
+                    apiUrl,
+                    data
+                );
 
                 if (response.IsSuccessStatusCode)
                 {
-                    SQLiteStorage.MarkAsSynced(
-                        session.Id
-                    );
+                    SQLiteStorage.MarkAsSynced(session.Id);
 
                     Console.WriteLine(
                         $"Uploaded: {session.Application}"
@@ -372,9 +451,15 @@ static void DisplayStatus(
                 );
 
                 // Keep Synced = 0
+                // It will be retried later.
             }
         }
     }
+    finally
+    {
+        uploadLock.Release();
+    }
+}
 
 
     static uint GetIdleSeconds()
